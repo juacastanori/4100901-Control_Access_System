@@ -2,7 +2,8 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Main program body with updated command, timer, LED ring,
+  *                   OLED bitmap display logic, and sleep mode functionality.
   ******************************************************************************
   * @attention
   *
@@ -16,17 +17,24 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
-/* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
+#include "keypad.h"
 #include "ring_buffer.h"
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
-#include "keypad.h"
-
+#include <string.h>
+#include <stdio.h>
+#include "ring.h"
+#include "locked.h"
+#include "unlocked.h"
+/* 
+   It is assumed that the following bitmaps are defined in another file.
+   Their dimensions are assumed to be 128x64 (for full screen) – adjust as needed.
+*/
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,30 +44,44 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define FW_VERSION "0.1.0\r\n"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define FW_VERSION "0.1.0"
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-uint16_t keypad_colum_pressed = 0;
-uint8_t b1_press_count = 0;
+uint8_t rx_byte;
+uint8_t start = 0;
 
-uint8_t pc_rx_data[32];
-ring_buffer_t pc_rx_buffer;
+/* --- Globals for door state --- */
+uint8_t door_permanent = 0;  // 0 = temporary/closed; 1 = permanently open
 
-uint8_t keypad_rx_data[32];
-ring_buffer_t keypad_rx_buffer;
+/* --- Global for temporary open timing (5 sec) --- */
+uint32_t temp_open_start = 0;
 
-uint8_t internet_rx_data[32];
-ring_buffer_t internet_rx_buffer;
+/* --- For button debouncing and tracking --- */
+uint32_t key_pressed_tick = 0;
+uint16_t column_pressed = 0;
+uint8_t byte_received_uart2;
+uint8_t byte_received_uart3;
+uint8_t button_press_count = 0;
+uint32_t last_button_press_time = 0;
+uint32_t debounce_tick = 0;
+uint32_t button_debounce_tick = 0;
+
+/* --- New globals for sleep/inactivity and mistakes --- */
+uint32_t last_activity_tick = 0;    // updated on every activity (button or UART)
+uint8_t mistake_count = 0;          // counts invalid (unrecognized) commands
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,89 +89,184 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void system_state_machine(void)
-{
-  static uint8_t state = 0;
-  static uint32_t last_state_change = 0;
 
-  switch (state)
-  {
-    case 0: // Door closed
-      HAL_GPIO_WritePin(DOOR_GPIO_Port, DOOR_Pin, GPIO_PIN_RESET);
-      break;
-    case 1: // Door temporarily opened
-      HAL_GPIO_WritePin(DOOR_GPIO_Port, DOOR_Pin, GPIO_PIN_SET);
-      if (HAL_GetTick() - last_state_change > 5000) {
-        state = 0;
-      }
-      break;
-    case 2: // Door permanent opened
-      HAL_GPIO_WritePin(DOOR_GPIO_Port, DOOR_Pin, GPIO_PIN_SET);
-      break;
-    default:
-      break;
-  }
-}
-
-void system_events_handler(uint8_t event)
-{
-  
-}
-
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if (GPIO_Pin == B1_Pin) { // Button
-    // capture event for door state machine
-    static uint32_t last_button_press = 0;
-    if (HAL_GetTick() - last_button_press < 100) {
+/* --- EXTI Callback updated to handle B1 and B2 ---
+     B1: door control (counts presses for temporary/permanent open)
+     B2: ring control – no action here (polled later)
+*/
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+  uint32_t current_tick = HAL_GetTick();
+  last_activity_tick = current_tick;  // any external interrupt resets inactivity timer
+  if (GPIO_Pin == B1_Pin) {
+    if ((current_tick - button_debounce_tick) < 200) {
       return;
     }
-    last_button_press = HAL_GetTick();
-    b1_press_count++;
-  } else { // Keypad
-    keypad_colum_pressed = GPIO_Pin;
+    button_debounce_tick = current_tick;
+    button_press_count++;
+    last_button_press_time = current_tick;
+  }
+  else if (GPIO_Pin == B2_Pin) {
+    // No immediate action; B2 is polled in main loop.
+  }
+  else {
+    if ((debounce_tick + 200) > current_tick) {
+      return;
+    }
+    debounce_tick = current_tick;
+    key_pressed_tick = current_tick;
+    column_pressed = GPIO_Pin;
   }
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART2) {
-    HAL_UART_Transmit(&huart3, huart->pRxBuffPtr, huart->RxXferSize, 1000);
-    HAL_UART_Receive_IT(&huart2, huart->pRxBuffPtr, huart->RxXferSize);
-  } else if (huart->Instance == USART3) {
-    HAL_UART_Transmit(&huart2, huart->pRxBuffPtr, huart->RxXferSize, 1000);
-    HAL_UART_Receive_IT(&huart3, huart->pRxBuffPtr, huart->RxXferSize);
-  }
-}
-
-/**
- * @brief  Heartbeat function to blink LED2 every 1 second to indicate the system is running
+/* --- Command definitions (all 5 characters) ---
+     CMD_START:      activates command mode
+     CMD_TEMP_OPEN:  open door temporarily (5 sec)
+     CMD_CLOSE:      close door
+     CMD_STATUS:     report door status
+     CMD_RESET:      reset system state
 */
+#define COMMAND_LENGTH 5
+const char CMD_START[]     = "#*#*#";
+const char CMD_TEMP_OPEN[] = "#*A*#";   // Temporary open command (5 sec)
+const char CMD_CLOSE[]     = "#*C*#";   // Close command
+const char CMD_STATUS[]    = "#*1*#";   // Status command
+const char CMD_RESET[]     = "#*0*#";   // Reset command
+
+ring_buffer_t rx_buffer;
+uint8_t rx_buffer_mem[64];
+char current_cmd[COMMAND_LENGTH];
+uint8_t cmd_index = 0;
+
+/* --- UART Receive Callback --- */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+  uint32_t current_tick = HAL_GetTick();
+  last_activity_tick = current_tick;  // activity detected from UART
+  if (huart == &huart2) {
+    ring_buffer_write(&rx_buffer, byte_received_uart2);
+    HAL_UART_Transmit(&huart3, &byte_received_uart2, 1, 10);
+    HAL_UART_Receive_IT(&huart2, &byte_received_uart2, 1);
+  } else if (huart == &huart3) {
+    ring_buffer_write(&rx_buffer, byte_received_uart3);
+    HAL_UART_Transmit(&huart2, &byte_received_uart3, 1, 10);
+    HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
+  }
+}
+
+/* --- Sleep mode functions --- */
+/* Inactivity sleep: if no activity for 30 sec, go to sleep until an interrupt wakes up */
+void sleep_mode_inactivity(void) {
+  uart_send_string("\r\nNo activity for 30 sec. Entering sleep mode.\r\n");
+  HAL_SuspendTick();
+  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  HAL_ResumeTick();
+  uart_send_string("\r\nAwake from inactivity sleep.\r\n");
+  last_activity_tick = HAL_GetTick();
+}
+
+/* Mistake sleep: if 5 invalid commands in a row, sleep for 10 sec */
+void sleep_mode_mistake(void) {
+  uart_send_string("\r\nToo many invalid commands. Sleeping for 10 sec.\r\n");
+  HAL_SuspendTick();
+  uint32_t sleepStart = HAL_GetTick();
+  HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+  // Ensure at least 10 sec pass before resuming
+  while(HAL_GetTick() - sleepStart < 10000) { }
+  HAL_ResumeTick();
+  uart_send_string("\r\nAwake from mistake sleep.\r\n");
+  mistake_count = 0;
+  last_activity_tick = HAL_GetTick();
+}
+
+/* --- Command processor --- */
+void process_commands(void) {
+  uint8_t byte;
+  while (ring_buffer_read(&rx_buffer, &byte)) {
+    memmove(current_cmd, current_cmd + 1, COMMAND_LENGTH - 1);
+    current_cmd[COMMAND_LENGTH - 1] = (char)byte;
+
+    if (memcmp(current_cmd, CMD_START, COMMAND_LENGTH) == 0) {
+      start = 1;
+      uart_send_string("\r\nCommand mode activated. Send commands.\r\n");
+      memset(current_cmd, 0, COMMAND_LENGTH);
+      mistake_count = 0;  // reset mistakes on valid start
+    }
+
+    if (start) {
+      if (memcmp(current_cmd, CMD_TEMP_OPEN, COMMAND_LENGTH) == 0) {
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
+        door_permanent = 0;
+        temp_open_start = HAL_GetTick();
+        uart_send_string("\r\nDoor opened temporarily (5 sec).\r\n");
+        memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
+      }
+      else if (memcmp(current_cmd, CMD_CLOSE, COMMAND_LENGTH) == 0) {
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+        door_permanent = 0;
+        temp_open_start = 0;
+        uart_send_string("\r\nDoor closed.\r\n");
+        memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
+      }
+      else if (memcmp(current_cmd, CMD_STATUS, COMMAND_LENGTH) == 0) {
+        uint8_t state = HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin);
+        uart_send_string(state ? "\r\nStatus: OPEN\r\n" : "\r\nStatus: CLOSED\r\n");
+        memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
+      }
+      else if (memcmp(current_cmd, CMD_RESET, COMMAND_LENGTH) == 0) {
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
+        door_permanent = 0;
+        temp_open_start = 0;
+        uart_send_string("\r\nSystem reset.\r\n");
+        memset(current_cmd, 0, COMMAND_LENGTH);
+        mistake_count = 0;
+      }
+      /* If the command buffer is nonempty (i.e. 5 characters have been received)
+         and does not match any valid command, count as an invalid command.
+         (This check is done only once per full command block.)
+      */
+      else {
+        /* If current_cmd is not all zeros, assume it is a full but invalid command */
+        if (current_cmd[0] != 0) {
+          mistake_count++;
+          char msg[50];
+          sprintf(msg, "\r\nInvalid command. %d tries remaining until sleep.\r\n", 5 - mistake_count);
+          uart_send_string(msg);
+          memset(current_cmd, 0, COMMAND_LENGTH);
+          if (mistake_count >= 5) {
+            sleep_mode_mistake();
+          }
+        }
+      }
+    }
+  }
+}
+
+/* --- Helper function to send strings via UART --- */
+void uart_send_string(const char *str) {
+  HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 100);
+  HAL_UART_Transmit(&huart3, (uint8_t *)str, strlen(str), 100);
+}
+
+/* --- Heartbeat function to toggle LD2 --- */
 void heartbeat(void)
 {
-  static uint32_t last_heartbeat = 0;
-  if (HAL_GetTick() - last_heartbeat > 1000)
-  {
-    last_heartbeat = HAL_GetTick();
+  static uint32_t last_tick = 0;
+  if ((last_tick + 500) < HAL_GetTick()) {
+    last_tick = HAL_GetTick();
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
   }
 }
 
-/**
- * @brief  Retargets the C library printf function to the USART.
-*/
-int _write(int file, char *ptr, int len)
-{
-  (void)file;
-  HAL_UART_Transmit(&huart2, (uint8_t *)ptr, len, 10);
-  return len;
-}
 /* USER CODE END 0 */
 
 /**
@@ -158,88 +275,143 @@ int _write(int file, char *ptr, int len)
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
-  /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart2, pc_rx_data, sizeof(pc_rx_data));
-  HAL_UART_Receive_IT(&huart3, keypad_rx_data, sizeof(keypad_rx_data));
-  
-  ring_buffer_init(&pc_rx_buffer, pc_rx_data, sizeof(pc_rx_data));
-  ring_buffer_init(&keypad_rx_buffer, keypad_rx_data, sizeof(keypad_rx_data));
-  ring_buffer_init(&internet_rx_buffer, internet_rx_data, sizeof(internet_rx_data));
+  MX_I2C1_Init();
 
+  /* USER CODE BEGIN 2 */
   ssd1306_Init();
   ssd1306_Fill(Black);
-  ssd1306_SetCursor(17, 17);
-  ssd1306_WriteString(FW_VERSION, Font_11x18, White);
   ssd1306_UpdateScreen();
+  keypad_init();
+  ring_buffer_init(&rx_buffer, rx_buffer_mem, sizeof(rx_buffer_mem));
+  memset(current_cmd, 0, COMMAND_LENGTH);
+  /* Initialize last_activity_tick to current time */
+  last_activity_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  printf("Firmware version: %s\r\n", FW_VERSION);
-  while (1) {
+  /* Start UART reception interrupts */
+  HAL_UART_Receive_IT(&huart2, &byte_received_uart2, 1);
+  HAL_UART_Receive_IT(&huart3, &byte_received_uart3, 1);
+  HAL_UART_Transmit(&huart2, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
+  HAL_UART_Transmit(&huart3, (uint8_t *)FW_VERSION, strlen(FW_VERSION), 10);
+
+  ssd1306_SetCursor(20, 20);
+  ssd1306_WriteString((char *)FW_VERSION, Font_7x10, White);
+  ssd1306_UpdateScreen();
+
+  /* Variables for ring LED toggling and B2 state tracking */
+  static uint32_t last_blink_tick = 0;
+  static uint8_t prev_b2_state = 0;
+
+  while (1)
+  {
     heartbeat();
 
-    if (b1_press_count > 0) {
-      b1_press_count = 0;
-      system_events_handler(b1_press_count);
+    /* Check inactivity sleep: if no activity for 30 sec, enter sleep mode */
+    if (HAL_GetTick() - last_activity_tick >= 30000) {
+      sleep_mode_inactivity();
     }
-    if (keypad_colum_pressed > 0) {
-      uint8_t key = keypad_scan(keypad_colum_pressed);
-      printf("Key pressed: %c\r\n", key);
-      system_events_handler(key);
-      keypad_colum_pressed = 0;
-    }
-    /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
+    /* Handle keypad column if needed */
+    if (column_pressed != 0 && (key_pressed_tick + 5) < HAL_GetTick()) {
+      uint8_t key = keypad_scan(column_pressed);
+      ring_buffer_write(&rx_buffer, key);
+      HAL_UART_Transmit(&huart2, &key, 1, 100);
+      HAL_UART_Transmit(&huart3, &key, 1, 100);
+      column_pressed = 0;
+    }
+
+    process_commands();
+
+    /* --- Updated B1 button handling ---
+         Single press: if door is not permanently open, open door temporarily (5 sec);
+                       if door is permanently open, then close it.
+         Double press: open door permanently.
+    */
+    if (button_press_count > 0 && (HAL_GetTick() - last_button_press_time) >= 500) {
+      if (button_press_count == 1) {
+        if (door_permanent) {
+          HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+          door_permanent = 0;
+          uart_send_string("\r\nButton: Door closed.\r\n");
+        } else {
+          HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
+          temp_open_start = HAL_GetTick();
+          uart_send_string("\r\nButton: Door opened temporarily (5 sec).\r\n");
+        }
+      } else if (button_press_count >= 2) {
+        HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
+        door_permanent = 1;
+        temp_open_start = 0;
+        uart_send_string("\r\nButton: Door opened permanently.\r\n");
+      }
+      button_press_count = 0;
+      last_button_press_time = 0;
+    }
+
+    /* --- Auto-close temporary door after 5 seconds ---
+         Only if door is not set to permanent.
+    */
+    if (!door_permanent && temp_open_start != 0 &&
+        (HAL_GetTick() - temp_open_start >= 5000)) {
+      HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+      uart_send_string("\r\nDoor auto-closed after temporary open.\r\n");
+      temp_open_start = 0;
+    }
+
+    /* --- Ring Button (B2) and OLED display handling ---
+         When B2 is pressed (GPIO high):
+             - The ring LED (LD5) is forced OFF.
+             - The OLED displays the ring bitmap.
+             - On a rising edge, a UART message is sent.
+         When B2 is not pressed:
+             - The ring LED toggles every 250 ms.
+             - The OLED displays the door state image:
+                 > If the door (LD4) is ON, display the "unlocked" bitmap.
+                 > Otherwise, display the "locked" bitmap.
+    */
+    uint8_t current_b2_state = HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
+    if (current_b2_state == GPIO_PIN_SET) {
+      if (!prev_b2_state) {
+        uart_send_string("\r\nRing pressed.\r\n");
+      }
+      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
+      ssd1306_Fill(Black);
+      ssd1306_DrawBitmap(0, 0, ring, 128, 64, White);
+      ssd1306_UpdateScreen();
+      prev_b2_state = 1;
+    } else {
+      if ((HAL_GetTick() - last_blink_tick) >= 250) {
+         last_blink_tick = HAL_GetTick();
+         HAL_GPIO_TogglePin(LD5_GPIO_Port, LD5_Pin);
+      }
+      ssd1306_Fill(Black);
+      if (HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin) == GPIO_PIN_SET) {
+         ssd1306_DrawBitmap(0, 0, unlocked, 128, 64, White);
+      } else {
+         ssd1306_DrawBitmap(0, 0, locked, 128, 64, White);
+      }
+      ssd1306_UpdateScreen();
+      prev_b2_state = 0;
+    }
   }
-  /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
+/* System Clock Configuration */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
   {
     Error_Handler();
   }
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -254,37 +426,47 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
+/* I2C1 Initialization Function */
+static void MX_I2C1_Init(void)
+{
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x10D19CE4;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USART2 Initialization Function */
 static void MX_USART2_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -299,27 +481,11 @@ static void MX_USART2_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
 }
 
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
+/* USART3 Initialization Function */
 static void MX_USART3_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -334,22 +500,12 @@ static void MX_USART3_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
+/* GPIO Initialization Function */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -357,88 +513,66 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, DOOR_Pin|LD2_Pin|ROW_1_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
+  /* Configure output pins for LD4, LD2, LD5, ROW_1 */
+  HAL_GPIO_WritePin(GPIOA, LD4_Pin|LD2_Pin|LD5_Pin|ROW_1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOB, ROW_2_Pin|ROW_4_Pin|ROW_3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : B1_Pin */
+  /* Configure B1 */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : RING_Pin */
-  GPIO_InitStruct.Pin = RING_Pin;
+  /* Configure B2 */
+  GPIO_InitStruct.Pin = B2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(RING_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DOOR_Pin LD2_Pin */
-  GPIO_InitStruct.Pin = DOOR_Pin|LD2_Pin;
+  /* Configure output pins for LD4, LD2, LD5 */
+  GPIO_InitStruct.Pin = LD4_Pin|LD2_Pin|LD5_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : COLUMN_1_Pin */
+  /* Configure keypad columns */
   GPIO_InitStruct.Pin = COLUMN_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(COLUMN_1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : COLUMN_4_Pin */
   GPIO_InitStruct.Pin = COLUMN_4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(COLUMN_4_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : COLUMN_2_Pin COLUMN_3_Pin */
   GPIO_InitStruct.Pin = COLUMN_2_Pin|COLUMN_3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ROW_1_Pin */
+  /* Configure keypad rows */
   GPIO_InitStruct.Pin = ROW_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(ROW_1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ROW_2_Pin ROW_4_Pin ROW_3_Pin */
   GPIO_InitStruct.Pin = ROW_2_Pin|ROW_4_Pin|ROW_3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB8 PB9 */
-  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
+  /* EXTI interrupt init */
   HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
-
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
 }
-
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -446,28 +580,14 @@ static void MX_GPIO_Init(void)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

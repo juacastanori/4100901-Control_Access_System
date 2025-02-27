@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Drivers/ssd1306/ssd1306.c
     Drivers/ssd1306/ssd1306_fonts.c
     Drivers/keypad/keypad.c
+    
     # Add user sources here
 )
 
@@ -58,6 +59,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     Drivers/ssd1306
     Drivers/keypad
+    Assets/
     # Add user defined include paths
 )
 
