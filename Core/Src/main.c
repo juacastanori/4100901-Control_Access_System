@@ -374,30 +374,29 @@ int main(void)
                  > If the door (LD4) is ON, display the "unlocked" bitmap.
                  > Otherwise, display the "locked" bitmap.
     */
-    uint8_t current_b2_state = HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
-    if (current_b2_state == GPIO_PIN_SET) {
+   uint8_t current_b2_state = HAL_GPIO_ReadPin(B2_GPIO_Port, B2_Pin);
+  if (current_b2_state == GPIO_PIN_RESET) {  // Button pressed (active low)
       if (!prev_b2_state) {
-        uart_send_string("\r\nRing pressed.\r\n");
+          uart_send_string("\r\nRing pressed.\r\n");
       }
-      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
+      // Turn the LED ON when the button is pressed.
+      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_SET);
       ssd1306_Fill(Black);
       ssd1306_DrawBitmap(0, 0, ring, 128, 64, White);
       ssd1306_UpdateScreen();
       prev_b2_state = 1;
-    } else {
-      if ((HAL_GetTick() - last_blink_tick) >= 250) {
-         last_blink_tick = HAL_GetTick();
-         HAL_GPIO_TogglePin(LD5_GPIO_Port, LD5_Pin);
-      }
+  } else {
+      // Turn the LED OFF when the button is not pressed.
+      HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, GPIO_PIN_RESET);
       ssd1306_Fill(Black);
       if (HAL_GPIO_ReadPin(LD4_GPIO_Port, LD4_Pin) == GPIO_PIN_SET) {
-         ssd1306_DrawBitmap(0, 0, unlocked, 128, 64, White);
+        ssd1306_DrawBitmap(0, 0, unlocked, 128, 64, White);
       } else {
-         ssd1306_DrawBitmap(0, 0, locked, 128, 64, White);
+        ssd1306_DrawBitmap(0, 0, locked, 128, 64, White);
       }
       ssd1306_UpdateScreen();
       prev_b2_state = 0;
-    }
+  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
