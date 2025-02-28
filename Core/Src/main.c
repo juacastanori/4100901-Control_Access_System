@@ -120,12 +120,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 }
 
 
-#define COMMAND_LENGTH 5
-const char CMD_START[]     = "#*#*#";
-const char CMD_TEMP_OPEN[] = "#*A*#";   // Temporary open command (5 sec)
-const char CMD_CLOSE[]     = "#*C*#";   // Close command
-const char CMD_STATUS[]    = "#*1*#";   // Status command
-const char CMD_RESET[]     = "#*0*#";   // Reset command
+#define COMMAND_LENGTH 3
+const char CMD_START[]     = "#*#";
+const char CMD_TEMP_OPEN[] = "#0#";   // Temporary open command (5 sec)
+const char CMD_CLOSE[]     = "#C#";   // Close command
+const char CMD_STATUS[]    = "#1#";   // Status command
+const char CMD_RESET[]     = "#8#";   // Reset command
 
 ring_buffer_t rx_buffer;
 uint8_t rx_buffer_mem[64];
@@ -174,13 +174,14 @@ void sleep_mode_mistake(void) {
 
 void process_commands(void) {
   uint8_t byte;
+  
   while (ring_buffer_read(&rx_buffer, &byte)) {
     memmove(current_cmd, current_cmd + 1, COMMAND_LENGTH - 1);
     current_cmd[COMMAND_LENGTH - 1] = (char)byte;
 
     if (memcmp(current_cmd, CMD_START, COMMAND_LENGTH) == 0) {
       start = 1;
-      uart_send_string("\r\nCommand mode activated. Send commands.\r\n");
+      uart_send_string("\r\nInput key : Correct.\r\n");
       memset(current_cmd, 0, COMMAND_LENGTH);
       mistake_count = 0;  // reset mistakes on valid start
     }
